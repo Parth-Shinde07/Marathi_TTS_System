@@ -1,53 +1,131 @@
 # OCR → Marathi Text → Speech (USER-FRIENDLY + PROSODY)
 
-# pip install gtts pygame customtkinter pillow pytesseract opencv-python numpy scipy soundfile
-
 import customtkinter as ctk
 from gtts import gTTS
-import pygame
-import os
+import pygame, os, re, tempfile
 import soundfile as sf
-from tkinter import filedialog
-from threading import Thread
 import numpy as np
 from scipy import signal
-import tempfile
-import pytesseract
+from threading import Thread
+from tkinter import filedialog
 from PIL import Image
+import pytesseract
+import pdfplumber
+import cv2
 
 pygame.mixer.init()
 
+# -------------------- Prosody --------------------
 class ProsodyModifier:
-    def apply(self, audio, level, emotion):
-        # Base from slider
+    def apply(self, audio, level, emotion, voice=None):
         speed = 0.9 + (level / 100) * 0.3
         intensity = 0.9 + (level / 100) * 0.8
         volume = 0.85 + (level / 100) * 0.5
 
-        # Emotion-specific adjustment
-        if emotion == "happy":
-            speed *= 1.1
-            intensity *= 1.2
-        elif emotion == "angry":
-            speed *= 1.15
-            intensity *= 1.4
-            volume *= 1.2
+        if emotion == "neutral":
+            speed *= 0.95
+            intensity *= 0.9
+            volume *= 0.9
+        elif emotion == "happy":
+            speed *= 1.2
         elif emotion == "sad":
             speed *= 0.85
             intensity *= 0.7
-            volume *= 0.8
+        elif emotion == "angry":
+            speed *= 1.15
+            intensity *= 1.4
+            volume *= 1.4
 
-        # Apply rhythm
+        if voice:
+            speed *= voice["speed"]
+            intensity *= voice["intensity"]
+            volume *= voice["volume"]
+
         audio = signal.resample(audio, int(len(audio) / speed))
-
-        # Apply intensity
         mean = np.mean(audio)
         audio = mean + (audio - mean) * intensity
-
         return audio * volume
 
 
-# -------------------- Marathi Dialect --------------------
+# -------------------- Emotion --------------------
+EMOTION_KEYWORDS = {
+    "happy": ["आनंद", "छान", "मस्त", "यश", "खुश"],
+    "sad": ["दुःख", "वाईट", "कष्ट", "त्रास", "ताण"],
+    "angry": ["राग", "चिड", "नको"]
+}
+
+def tokenize(text):
+    return re.findall(r'\w+', text.lower())
+
+def detect_emotion(text, story=False):
+    if story:
+        return "neutral"
+    words = tokenize(text)
+    scores = {k: 0 for k in EMOTION_KEYWORDS}
+    for e, keys in EMOTION_KEYWORDS.items():
+        for k in keys:
+            if k in words:
+                scores[e] += 1
+    best = max(scores, key=scores.get)
+    return best if scores[best] else "neutral"
+
+
+# -------------------- Voices --------------------
+VOICES = {
+    "narration": {"speed": 0.95, "intensity": 0.9, "volume": 0.9},
+    "dialogue": {"speed": 1.05, "intensity": 1.0, "volume": 1.05},
+}
+
+
+def split_story(text):
+    lines = text.split("\n")
+    segments = []
+    for l in lines:
+        l = l.strip()
+        if not l:
+            continue
+        if l.startswith(("\"", "“")):
+            segments.append((l.strip("“”\""), "dialogue"))
+        else:
+            segments.append((l, "narration"))
+    return segments
+
+
+# -------------------- OCR --------------------
+def extract_text_from_image(path):
+    img = Image.open(path)
+    return pytesseract.image_to_string(img, lang="mar").strip()
+
+def extract_text_from_document(path):
+    text = ""
+    if path.endswith(".txt"):
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    elif path.endswith(".pdf"):
+        with pdfplumber.open(path) as pdf:
+            for p in pdf.pages:
+                text += p.extract_text() or ""
+    return text.strip()
+
+def extract_text_from_camera():
+    cap = cv2.VideoCapture(0)
+    text = ""
+    while True:
+        ret, frame = cap.read()
+        cv2.imshow("SPACE = capture | ESC = exit", frame)
+        k = cv2.waitKey(1)
+        if k == 32:
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            text = pytesseract.image_to_string(img, lang="mar")
+            break
+        elif k == 27:
+            break
+    cap.release()
+    cv2.destroyAllWindows()
+    return text.strip()
+
+
+# -------------------- Dialects --------------------
 class MarathiDialect:
     def __init__(self, rules):
         self.rules = rules
@@ -57,92 +135,67 @@ class MarathiDialect:
             text = text.replace(k, v)
         return text
 
-def detect_emotion_from_text(text):
-    text = text.strip()
+DIALECTS = {
+    "Standard": MarathiDialect({}),
+    "Varhadi": MarathiDialect({"आहे": "आय", "नाही": "नाय", "मी": "म्ही",
+                               'गा': 'मा', 'ळ': 'ल',
+                               'काय': 'काय', 'तू': 'तु',
+                               'आपण': 'आपुण', 'झाला': 'झाला',
+                               'पाकहजे': 'पाकहजे', 'बोलतो': 'बोलतो'}),
 
-    if "!" in text or any(w in text for w in ["आनंद", "खूप छान", "यश"]):
-        return "happy"
+    "Malvani": MarathiDialect({"आहे": "आसा", "नाही": "ना", "मला": "माका",
+                               'व': 'व्ह', 'च': 'च', 'झ': 'झ', 'आहे': 'आस',
+                               'नाही': 'नाय', 'काय': 'काय',
+                               'कसं': 'कसं', 'तुला': 'तुज्जा',
+                               'मला': 'मज्जा', 'पाकहजे': 'पायजे'}),
 
-    if any(w in text for w in ["दुःख", "वाईट", "कष्ट", "त्रास"]):
-        return "sad"
+    "Ahirani": MarathiDialect({"आहे": "हाय", "नाही": "नाय",
+                               'आहे': 'हाय', 'नाही': 'नाय', 'मला': 'म्हाला',
+                               'तुला': 'तुला', 'झाला': 'झालं',
+                               'काय': 'काय', 'कसं': 'कसं',
+                               'पाकहजे': 'पायजे', 'जातो': 'जातो'}),
 
-    if any(w in text for w in ["राग", "नको", "चिड", "बस"]):
-        return "angry"
-
-    return "neutral"
-
-def add_emotion_pauses(text, emotion):
-    if emotion == "sad":
-        text = text.replace("।", "… ")
-    elif emotion == "angry":
-        text = text.replace("।", "! ")
-    return text
+    "Kokani": MarathiDialect({'आहे': 'आसा', 'नाही': 'ना', 'काय': 'ककतं',
+                              'कसं': 'कसं', 'तुला': 'तुका',
+                              'मला': 'माका', 'पाकहजे': 'जाय'})
+}
 
 
-# -------------------- Marathi TTS --------------------
+# -------------------- TTS --------------------
 class MarathiTTS:
     def __init__(self):
         self.prosody = ProsodyModifier()
-        self.temp_file = None
-        self.is_playing = False
+        self.temp = None
 
-        # Marathi regional dialect rules
-        self.dialects = {
-            "Standard": MarathiDialect({}),
-            "Varhadi": MarathiDialect({
-                "आहे": "आय", "नाही": "नाय", "मला": "म्हाला"
-            }),
-            "Ahirani": MarathiDialect({
-                "आहे": "हाय", "नाही": "नाय", "मला": "म्हाला"
-            }),
-            "Malwani": MarathiDialect({
-                "आहे": "आस", "नाही": "नाय", "मला": "मका"
-            })
-        }
+    def generate(self, text, level, dialect, story):
+        text = DIALECTS[dialect].apply(text)
+        segments = split_story(text)
+        audios = []
 
-    def generate(self, text, prosody_level, dialect):
-        # detect emotion
-        emotion = detect_emotion_from_text(text)
+        for seg, seg_type in segments:
+            emotion = detect_emotion(seg, story)
+            voice = VOICES["dialogue"] if seg_type == "dialogue" else VOICES["narration"]
 
-        # apply dialect
-        text = self.dialects[dialect].apply(text)
+            mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+            wav = mp3.replace(".mp3", ".wav")
 
-        # apply emotion pauses
-        text = add_emotion_pauses(text, emotion)
+            gTTS(seg, lang="mr").save(mp3)
+            audio, sr = sf.read(mp3)
+            audio = self.prosody.apply(audio, level, emotion, voice)
 
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        wav_path = tmp.name
-        mp3_path = wav_path.replace(".wav", ".mp3")
-        tmp.close()
+            audios.append(audio)
+            os.remove(mp3)
 
-        gTTS(text=text, lang="mr").save(mp3_path)
-        audio, sr = sf.read(mp3_path)
-
-        # apply emotion-aware prosody
-        audio = self.prosody.apply(audio, prosody_level, emotion)
-
-        sf.write(wav_path, audio, sr)
-        os.remove(mp3_path)
-
-        self.temp_file = wav_path
-
+        final = np.concatenate(audios)
+        self.temp = wav
+        sf.write(wav, final, sr)
 
     def play(self):
-        if self.temp_file:
-            pygame.mixer.music.load(self.temp_file)
-            pygame.mixer.music.play()
-            self.is_playing = True
+        pygame.mixer.music.load(self.temp)
+        pygame.mixer.music.play()
 
     def stop(self):
         pygame.mixer.music.stop()
-        self.is_playing = False
-
-
-
-# -------------------- OCR --------------------
-def extract_text_from_image(path):
-    img = Image.open(path)
-    return pytesseract.image_to_string(img, lang="mar").strip()
 
 
 # -------------------- GUI --------------------
@@ -151,130 +204,79 @@ class OCRTTSApp:
         self.tts = MarathiTTS()
         self.text = ""
 
-        ctk.set_appearance_mode("light")
         self.win = ctk.CTk()
-        self.win.title("OCR आधारित मराठी TTS")
         self.win.geometry("700x550")
+        self.win.title("Marathi OCR TTS")
 
-        self.frame = ctk.CTkFrame(self.win)
-        self.frame.pack(expand=True, fill="both", padx=20, pady=20)
+        frame = ctk.CTkFrame(self.win)
+        frame.pack(expand=True, fill="both", padx=20, pady=20)
 
-        ctk.CTkLabel(
-            self.frame,
-            text="OCR → मराठी टेक्स्ट-टू-स्पीच",
-            font=("Arial", 22, "bold")
-        ).pack(pady=10)
+        ctk.CTkButton(frame, text="📁 Image / Document", command=self.select_input).pack(pady=5)
+        ctk.CTkButton(frame, text="📷 Camera OCR", command=self.camera_input).pack(pady=5)
 
-        ctk.CTkButton(
-            self.frame,
-            text="📷 Marathi Image निवडा",
-            font=("Arial", 15),
-            height=45,
-            command=self.select_image
-        ).pack(pady=10)
+        self.box = ctk.CTkTextbox(frame, height=250)
+        self.box.pack(fill="x", pady=10)
+        self.box.configure(state="disabled")
 
-        # OCR text display
-        ctk.CTkLabel(self.frame, text="OCR Extracted Text").pack(pady=(10, 5))
-        self.ocr_textbox = ctk.CTkTextbox(self.frame, height=300)
-        self.ocr_textbox.pack(fill="x", padx=20)
-        self.ocr_textbox.configure(state="disabled")
+        self.story = ctk.BooleanVar()
+        ctk.CTkCheckBox(frame, text="Story Mode", variable=self.story).pack()
 
-        # Emotion display
-        self.emotion_label = ctk.CTkLabel(
-            self.frame, text="Detected Emotion: -", font=("Arial", 14, "bold")
-        )
-        self.emotion_label.pack(pady=8)
+        self.slider = ctk.CTkSlider(frame, from_=0, to=100)
+        self.slider.set(50)
+        self.slider.pack(fill="x", pady=10)
 
-        # Prosody slider
-        ctk.CTkLabel(self.frame, text="Prosody Control").pack(pady=5)
-        self.prosody_slider = ctk.CTkSlider(
-            self.frame, from_=0, to=100, number_of_steps=100
-        )
-        self.prosody_slider.set(50)
-        self.prosody_slider.pack(fill="x", padx=30)
+        self.dialect = ctk.StringVar(value="Standard")
+        ctk.CTkOptionMenu(frame, values=list(DIALECTS.keys()), variable=self.dialect).pack()
 
-        # Dialect selection
-        ctk.CTkLabel(self.frame, text="Marathi Regional Language").pack(pady=5)
-        self.dialect_var = ctk.StringVar(value="Standard")
-        ctk.CTkOptionMenu(
-            self.frame,
-            values=["Standard", "Varhadi", "Ahirani", "Malwani"],
-            variable=self.dialect_var
-        ).pack(pady=5)
+        ctk.CTkButton(frame, text="▶ Speak", command=self.speak).pack(pady=5)
+        ctk.CTkButton(frame, text="⏹ Stop", command=self.tts.stop).pack()
 
-        # Buttons
-        btn_frame = ctk.CTkFrame(self.frame)
-        btn_frame.pack(pady=20, fill="x")
+    def update_ui(self, text):
+        self.text = text
+        self.box.configure(state="normal")
+        self.box.delete("1.0", "end")
+        self.box.insert("end", text)
+        self.box.configure(state="disabled")
 
-        ctk.CTkButton(
-            btn_frame, text="▶ Run / Speak", command=self.run_tts
-        ).pack(side="left", expand=True, padx=10)
-
-        ctk.CTkButton(
-            btn_frame, text="⏹ Stop", command=self.stop_tts
-        ).pack(side="right", expand=True, padx=10)
-
-        self.status = ctk.CTkLabel(self.frame, text="")
-        self.status.pack(pady=10)
-
-    def safe_ui_update(self, func):
-        self.win.after(0, func)
-
-    def select_image(self):
+    def select_input(self):
         path = filedialog.askopenfilename(
-            filetypes=[("Image Files", "*.png *.jpg *.jpeg")]
+            parent=self.win,
+            filetypes=[("Images", "*.png *.jpg *.jpeg"), ("Docs", "*.pdf *.txt")]
         )
         if not path:
             return
 
-        self.status.configure(text="OCR चालू आहे...")
-
         def task():
-            text = extract_text_from_image(path)
-            emotion = detect_emotion_from_text(text) if text else "Neutral"
-
-            def update_ui():
-                if text:
-                    self.text = text
-                    self.ocr_textbox.configure(state="normal")
-                    self.ocr_textbox.delete("1.0", "end")
-                    self.ocr_textbox.insert("end", text)
-                    self.ocr_textbox.configure(state="disabled")
-                    self.emotion_label.configure(
-                        text=f"Detected Emotion: {emotion}"
-                    )
-                    self.status.configure(text="OCR पूर्ण – Run दाबा")
-                else:
-                    self.status.configure(text="मजकूर सापडला नाही")
-
-            self.safe_ui_update(update_ui)
+            text = extract_text_from_image(path) if path.endswith((".png", ".jpg", ".jpeg")) else extract_text_from_document(path)
+            self.win.after(0, lambda: self.update_ui(text))
 
         Thread(target=task, daemon=True).start()
 
-    def run_tts(self):
+    def camera_input(self):
+        Thread(
+            target=lambda: self.win.after(0, lambda: self.update_ui(extract_text_from_camera())),
+            daemon=True
+        ).start()
+
+    def speak(self):
         if not self.text:
-            self.status.configure(text="आधी Image निवडा")
             return
 
-        self.status.configure(text="बोलणे सुरू आहे...")
-        level = self.prosody_slider.get()
-        dialect = self.dialect_var.get()
+        level = self.slider.get()
+        dialect = self.dialect.get()
+        story = self.story.get()
 
-        def task():
-            self.tts.generate(self.text, level, dialect)
-            self.tts.play()
-
-        Thread(target=task, daemon=True).start()
-
-    def stop_tts(self):
-        self.tts.stop()
-        self.status.configure(text="बोलणे थांबवले")
+        Thread(
+            target=lambda: (
+                self.tts.generate(self.text, level, dialect, story),
+                self.tts.play()
+            ),
+            daemon=True
+        ).start()
 
     def run(self):
         self.win.mainloop()
 
 
-
-# -------------------- Main --------------------
 if __name__ == "__main__":
     OCRTTSApp().run()
