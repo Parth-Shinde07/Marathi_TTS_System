@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.idea/
+*.log
+*.wav
+marathi_human_model/
+tts_30k_output/
