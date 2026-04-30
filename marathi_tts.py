@@ -20,10 +20,11 @@ import matplotlib
 matplotlib.use('Agg') # Use non-interactive backend for background processing if needed
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import noisereduce as nr
 
 # Initialize mixer at high fidelity frequency (24kHz) at top level
 if not pygame.mixer.get_init():
-    # Large buffer (8192) for high-fidelity analog mastering support
+    # Larger buffer (8192) prevents stuttering during high-fidelity mastering
     pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=8192)
 
 # -------------------- Prosody (for gTTS) --------------------
@@ -48,7 +49,8 @@ class ProsodyModifier:
             "excited":  {"speed": 1.05, "intensity": 1.08, "volume": 1.0, "pitch": 0.5, "freq_hz": 240.0},
             "calm":     {"speed": 0.95, "intensity": 0.92, "volume": 0.9, "pitch": 0.0, "freq_hz": 155.0},
             "fear":     {"speed": 1.08, "intensity": 1.02, "volume": 1.0, "pitch": 0.6, "freq_hz": 230.0},
-            "shock":    {"speed": 1.12, "intensity": 1.25, "volume": 1.1, "pitch": 0.9, "freq_hz": 260.0}
+            "shock":    {"speed": 1.12, "intensity": 1.25, "volume": 1.1, "pitch": 0.9, "freq_hz": 260.0},
+            "serious":  {"speed": 0.98, "intensity": 1.05, "volume": 1.0, "pitch": -0.1, "freq_hz": 140.0}
         }
         
         profile = emotion_profiles.get(emotion, emotion_profiles["neutral"])
@@ -78,9 +80,9 @@ class ProsodyModifier:
         audio = audio - np.mean(audio)
 
         # 2. Apply Speed (Time-Stretching)
-        # For High-Fidelity, we only use librosa if we're in gTTS mode.
-        # ML Engines will handle speed natively to avoid metallic noise.
-        is_native_speed = voice.get("is_native", False)
+        # For ML Engines, we prefer native scaling (speaking_rate) which is artifact-free.
+        # librosa is only used as a fallback for gTTS or non-native voices.
+        is_native_speed = voice.get("is_native", True) # Default to True for ML-era voices
         
         if not is_native_speed and abs(speed - 1.0) > 0.01:
             try:
@@ -89,7 +91,7 @@ class ProsodyModifier:
             except Exception as e:
                 print(f"Time stretch error: {e}")
 
-        # 3. Apply Pitch Shifting
+        # 3. Apply Pitch Shifting (Use only if specifically requested, as it adds FFT noise)
         if not is_native_speed and abs(pitch) > 0.05:
             try:
                 import librosa
@@ -102,7 +104,7 @@ class ProsodyModifier:
             mean = np.mean(audio)
             audio = mean + (audio - mean) * intensity
         
-        # 5. Noise Reduction (Bandpass: 100Hz - 8kHz)
+        # 5. Advanced Mastering (Noise Reduction + High-Cut)
         audio = remove_noise(audio, sr)
          
         # 6. Apply Volume
@@ -111,10 +113,10 @@ class ProsodyModifier:
         # 7. Apply Smooth Transitions
         audio = apply_fades(audio, sr)
 
-        # 8. Natural Limiting (Prevents digital clipping)
+        # 8. Natural Limiting & Soft Clipping
         max_val = np.abs(audio).max()
-        if max_val > 0.95:
-            audio = audio / max_val * 0.95
+        if max_val > 0.98:
+            audio = np.tanh(audio / max_val) * 0.95 # Soft knee limiting
         
         # Expert Tip: Explicitly handle DC bias early to prevent feedback in neural layers
         audio = audio - np.mean(audio)
@@ -195,35 +197,54 @@ class MarathiNormalizer:
         return text
 
 def clean_marathi_ocr(text: str) -> str:
-    """Expert cleaner for Devanagari OCR text to optimize for VITS/Neural TTS."""
-    if not text: return ""
+    """Clean OCR hallucinations and broken Marathi characters."""
+    if not text:
+        return ""
 
-    # Clear Unicode noise (ZWS, ZWJ, ZWNJ which confuse neural models)
-    text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
+    # Remove the dotted circle symbol and zero-width characters
+    text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '').replace('\u25CC', '')
     
+    # Remove standalone OCR hallucinations like 'ट्र', 'टू', and 'ट््'
+    # Tesseract frequently inserts these phantom characters when trying to read shadows
+    text = re.sub(r'\b[ट्रटू]\b', '', text)
+    text = re.sub(r'[ट्रटू]$', '', text)
+    text = re.sub(r'ट््', '', text)
+    
+    # Fix common word gluing and structural misreadings
+    text = text.replace('आजचादिवस', 'आजचा दिवस')
+    text = text.replace('विडे ना', 'ही')
+    text = text.replace('ट् ', '')
+    text = text.replace('◌', '') # Remove dotted circles
+    
+    # Standardize whitespace and remove non-Marathi characters
     text = re.sub(r"[\t\r\n]+", " ", text)
-    # Preservation of Marathi punctuation and standard Devanagari range
     text = re.sub(r"[^\u0900-\u097F ।॥!?%,.:;…\.]", " ", text)
     
-    # Normalize Marathi Danda variations to standard Unicode Devanagari Danda
-    text = text.replace('|', '।')
-    
-    # --- Aggressive Devanagari Ligature Fixes (v2) ---
-    # Join ANY dependent Devanagari mark (Matras, Anusvara, etc.) to the preceding character
-    # Marks range: \u0900-\u0903 (Anusvara/Visarga) and \u093A-\u0957 (Vowel signs/Nukta/Halant)
+    # Fix detached Matras (vowel signs) by gluing them back to the previous character
     text = re.sub(r'\s+([\u0900-\u0903\u093A-\u0957])', r'\1', text)
     
-    # 2. Apply Marathi Normalization
-    text = MarathiNormalizer.normalize(text)
-    
-    # Prudent phrasing breaks (space around punctuation)
-    text = re.sub(r'([।॥!?%,.:;…])', r' \1 ', text)
-    
-    # Remove multiple spaces
+    # Final cleanup of pipes and double spaces
+    text = text.replace('|', '।')
     text = re.sub(r" {2,}", " ", text)
 
-    return text.strip()
+    # Fix broken clusters and ensure halants are followed by correct consonants
+    text = re.sub(r'([^\u0900-\u097F])्', r'\1', text) # Remove stray halants
+    
+    # Syllable Stress / Phonetic Repair: Insert Zero-Width Space (ZWSP) for complex words
+    # to help the VITS engine articulate distinct syllables in long compounds.
+    complex_repairs = {
+        'क्रीडांगण': 'क्री​डां​ग​ण', 
+        'प्रयोगशाळा': 'प्र​यो​ग​शा​ळा',
+        'संगणक': 'सं​ग​ण​क',
+        'प्रशासकीय': 'प्र​शा​स​की​य'
+    }
+    for word, repair in complex_repairs.items():
+        text = text.replace(word, repair)
 
+    # Use the existing MarathiNormalizer class in your file
+    text = MarathiNormalizer.normalize(text)
+    
+    return text.strip()
 
 def generate_silence(duration_sec, sr):
     """Generate clean silence."""
@@ -248,20 +269,46 @@ def apply_fades(audio, sr, fade_ms=40):
 
 def remove_noise(audio, sr):
     """
-    Apply a speech-optimized band-pass filter.
-    Cuts low-end rumble and high-end hiss while preserving 'air'.
+    Advanced Studio Mastering Chain:
+    1. Zero-phase DC Offset removal.
+    2. Adaptive stationary noise reduction (Hiss removal).
+    3. Zero-phase High-Cut filter (9kHz).
+    4. Soft Noise Gate (Logarithmic release).
     """
     try:
-        from scipy.signal import butter, lfilter
-        # Bandpass: 80Hz to 11000Hz for high-fidelity speech
-        lowcut = 80
-        highcut = min(11000, sr // 2 - 100)
-        nyq = 0.5 * sr
-        low = lowcut / nyq
-        high = highcut / nyq
-        b, a = butter(4, [low, high], btype='band')
-        return lfilter(b, a, audio)
-    except:
+        import noisereduce as nr
+        from scipy.signal import butter, sosfiltfilt
+        
+        # Ensure float32 for processing
+        audio = audio.astype(np.float32)
+        
+        # 1. Zero-mean the signal (DC Offset)
+        audio = audio - np.mean(audio)
+        
+        # 2. Adaptive Hiss Reduction
+        # prop_decrease=0.7 is the "sweet spot" for vocoder hiss
+        audio = nr.reduce_noise(y=audio, sr=sr, prop_decrease=0.7, stationary=True)
+        
+        # 3. High-Cut Filter (9kHz) using Zero-phase SOS filter
+        sos = butter(4, 9000, btype='low', fs=sr, output='sos')
+        audio = sosfiltfilt(sos, audio)
+        
+        # 4. Soft Noise Gate
+        # Instead of hard-cutting, we gently fade out silence to avoid clicks
+        rms = np.sqrt(np.mean(audio**2))
+        gate_threshold = rms * 0.1 # Dynamic threshold based on average level
+        
+        # Simple soft-gate implementation
+        mask = np.abs(audio) > gate_threshold
+        # Smooth the mask using a simple moving average (kernel size ~50ms)
+        kernel_size = int(0.05 * sr)
+        if kernel_size > 0:
+            smooth_mask = np.convolve(mask.astype(float), np.ones(kernel_size)/kernel_size, mode='same')
+            audio = audio * smooth_mask
+            
+        return audio.astype(np.float32)
+    except Exception as e:
+        print(f"Mastering Warning: {e}")
         return audio
 
 
@@ -302,7 +349,7 @@ def get_pause_duration(text, next_text=None, is_last=False):
     elif text.endswith("…") or text.endswith("..."):
         return 1.4
     elif text.endswith(","):
-        return 0.6 # Clear comma break for phrasing
+        return 0.4 # Short breath for commas
     elif text.endswith((";", ":")):
         return 0.8
     else:
@@ -339,6 +386,9 @@ EMOTION_KEYWORDS = {
     ],
     "shock": [
         "धक्का", "आश्चर्य", "चकित", "शॉक", "बापरे", "अरे", "काय", "खरंच", "कसे", "स्वप्न"
+    ],
+    "serious": [
+        "महत्त्वाचे", "गंभीर", "लक्ष", "नियम", "कायदा", "शासन", "कर्तव्य", "जबाबदारी"
     ]
 }
 
@@ -348,7 +398,8 @@ INTENSIFIERS = ["खूप", "फार", "अतिशय", "अगदी", "�
 def detect_emotion(text, story=False):
     """Detect emotion with strict word-boundary matching and neutral bias."""
     if story:
-        return "neutral"
+        # Stories now allow full emotion detection for dramatic effect
+        pass
 
     text_clean = re.sub(r"[^\u0900-\u097F ]", " ", text)
     words = set(text_clean.split())
@@ -425,44 +476,90 @@ def split_into_sentences(text):
 
 
 # -------------------- OCR --------------------
-def extract_text_from_image(path):
-    img = Image.open(path)
-    text = pytesseract.image_to_string(img, lang="mar", config="--psm 6")
-    return clean_marathi_ocr(text)
+def preprocess_for_ocr(img_cv):
+    """Apply aggressive OpenCV filters to make Devanagari text highly readable by Tesseract."""
+    # 1. Grayscale
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    
+    # 2. Resize (Tesseract needs high resolution, ~300 DPI equivalent)
+    gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    
+    # 3. Noise Removal
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # 4. Adaptive Thresholding (Binarization: stark white background, black text)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # 5. Morphological Closing (Connects broken Devanagari strokes and matras)
+    kernel = np.ones((2, 2), np.uint8)
+    processed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    
+    return processed
 
+
+def extract_text_from_image(path):
+    """Enhanced OCR for Marathi with structural preservation."""
+    try:
+        img = cv2.imread(path)
+        if img is None: return ""
+        
+        # Preprocess using the advanced pipeline
+        processed_img = preprocess_for_ocr(img)
+        
+        # --psm 6: Assumes a single uniform block of text.
+        # --oem 3: Uses the best available engine (LSTM).
+        custom_config = r'--oem 3 --psm 6 -l mar -c preserve_interword_spaces=1'
+        
+        text = pytesseract.image_to_string(processed_img, config=custom_config)
+        return clean_marathi_ocr(text)
+    except Exception as e:
+        print(f"Image OCR Error: {e}")
+        return ""
 
 def extract_text_from_document(path):
+    """Extract text from PDF/TXT and clean it immediately."""
     text = ""
-    if path.endswith(".txt"):
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
-    elif path.endswith(".pdf"):
-        with pdfplumber.open(path) as pdf:
-            for p in pdf.pages:
-                text += p.extract_text() or ""
-    return clean_marathi_ocr(text)
+    try:
+        if path.endswith(".txt"):
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        elif path.endswith(".pdf"):
+            with pdfplumber.open(path) as pdf:
+                for p in pdf.pages:
+                    # layout=True helps keep Marathi words together
+                    page_content = p.extract_text(layout=True)
+                    if page_content:
+                        text += page_content + " "
+        
+        return clean_marathi_ocr(text)
+    except Exception as e:
+        print(f"Document Extraction Error: {e}")
+        return ""
 
 
 def extract_text_from_camera():
     cap = cv2.VideoCapture(0)
     text = ""
-    img = None
+    processed_img = None
+    
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
+        
         cv2.imshow("SPACE = capture | ESC = exit", frame)
         k = cv2.waitKey(1)
-        if k == 32:
-            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            text = pytesseract.image_to_string(img, lang="mar", config="--psm 6")
+        if k == 32: # SPACE
+            processed_img = preprocess_for_ocr(frame)
             break
-        elif k == 27:
+        elif k == 27: # ESC
             break
+            
     cap.release()
     cv2.destroyAllWindows()
-    if img:
-        text = pytesseract.image_to_string(img, lang="mar", config="--psm 6")
+    
+    if processed_img is not None:
+        text = pytesseract.image_to_string(processed_img, lang="mar", config="--psm 6 -c preserve_interword_spaces=1")
+    
     return clean_marathi_ocr(text)
 
 
@@ -537,51 +634,58 @@ class MarathiTTS:
         
         voice = VOICES["dialogue"] if '"' in sent or "'" in sent else VOICES["narration"]
         voice["is_native"] = False
-        audio = None
-        orig_sr = target_sr
+        use_ml = True # Defaulting to True for VITS engine usage
+        
+        # Emphasis check for boost
+        emphasis_words = ["खूप", "फार", "अतिशय"]
+        emphasis_boost = 0.2 if any(w in clean_sent for w in emphasis_words) else 0.0
+        
+        # Log global emotion tag at start of processing
+        print(f"[GLOBAL EMOTION TAG]: {emotion.upper()}")
 
-        if use_ml:
-            try:
-                engine = self._get_ml_engine(engine_type)
-                audio, orig_sr = engine.generate_speech(
-                    clean_sent, 
-                    speed=1.0 + (level - 50) / 300.0, 
-                    emotion=emotion, 
-                    voice_tone=voice_tone,
-                    realism_mode=realism_mode
-                )
-                voice["is_native"] = True
-            except Exception as e:
-                print(f"ML Error: {e}")
-                use_ml = False
-
+        # Generate audio for the whole sentence at once for better fluency/co-articulation
+        audio, orig_sr = self._generate_raw_audio(clean_sent, level, dialect, emotion, voice_tone, realism_mode, engine_type)
+        
         if audio is None:
-            # Cloud gTTS Fallback
-            mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
-            try:
-                gTTS(clean_sent, lang="mr").save(mp3)
-                audio, orig_sr = librosa.load(mp3, sr=None)
-                if os.path.exists(mp3): os.remove(mp3)
-            except:
-                if os.path.exists(mp3): os.remove(mp3)
-                return None, target_sr, emotion, 0
+            return None, target_sr, emotion, 0
 
-        # Resample for uniformity
-        if orig_sr != target_sr:
-            audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
-        
-        boost = punctuation_intensity(clean_sent)
-        current_level = level if not use_ml else (level * 0.7)
-        
-        audio = self.prosody.apply(audio, current_level, emotion, voice, intensity_boost=boost, sentence_type=sentence_type, sr=target_sr)
-        
-        # Add pause
-        pause_duration = get_pause_duration(clean_sent)
-        silence = generate_silence(pause_duration, target_sr)
+        # Apply prosody mastering
+        audio = self.prosody.apply(
+            audio, 
+            level if not use_ml else (level * 0.7), 
+            emotion, 
+            voice, 
+            intensity_boost=emphasis_boost, 
+            sentence_type=sentence_type, 
+            sr=target_sr
+        )
+
+        # Add expert-requested breathing pause at the end of the sentence
+        # (VITS handles internal commas naturally; we add the major breath here)
+        pause_sec = 1.1 if clean_sent.endswith(("।", ".", "!", "?")) else 0.4
+        silence = generate_silence(pause_sec, target_sr)
         audio = np.concatenate([audio, silence])
         
         duration = len(audio) / target_sr
         return audio, target_sr, emotion, duration
+
+    def _generate_raw_audio(self, text, level, dialect, emotion, voice_tone, realism_mode, engine_type):
+        target_sr = 24000
+        try:
+            engine = self._get_ml_engine(engine_type)
+            audio, orig_sr = engine.generate_speech(
+                text, 
+                speed=1.0 + (level - 50) / 300.0, 
+                emotion=emotion, 
+                voice_tone=voice_tone,
+                realism_mode=realism_mode
+            )
+            if orig_sr != target_sr:
+                audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
+            return audio, target_sr
+        except Exception as e:
+            print(f"ML Segment Error: {e}")
+            return None, target_sr
 
     def generate(self, text, level, dialect, story):
         # We now keep this for batch generation if needed, but speak() will use the new streaming logic.
@@ -613,11 +717,15 @@ class MarathiTTS:
             # --- PRE-PLAY MASTERING ENGINE (Crisp-Human Edition) ---
             try:
                 from scipy.signal import butter, lfilter
-                # 1. Presence & Intelligibility Boost (3.5kHz - 7kHz)
-                # This makes consonants like 'स', 'श', 'क्ष' much clearer
-                b, a = butter(2, [3500/12000, 7000/12000], btype='bandpass')
-                crisp = lfilter(b, a, final)
-                final = final + (crisp * 0.22)
+                # 1. Peaking EQ for presence (surgical boost at 5kHz)
+                # This avoids adding noise from other bands
+                w0 = 2 * np.pi * 5000 / 12000
+                alpha = np.sin(w0) / 2.0
+                gain_db = 1.5
+                A = 10**(gain_db/40)
+                b = [1 + alpha * A, -2 * np.cos(w0), 1 - alpha * A]
+                a = [1 + alpha / A, -2 * np.cos(w0), 1 - alpha / A]
+                final = lfilter(b, a, final)
                 
                 # 2. Vowel Warmth (400Hz - 800Hz)
                 b_warm, a_warm = butter(1, [400/12000, 800/12000], btype='bandpass')

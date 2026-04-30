@@ -1,0 +1,72 @@
+{
+    "model": "vits",
+    "run_name": "marathi_vits_30k_complete",
+    "model_args": {
+        "num_chars": 100,
+        "out_channels": 513,
+        "spec_channels": 513,
+        "hidden_channels": 192,
+        "filter_channels": 768,
+        "n_heads": 2,
+        "n_layers": 6,
+        "kernel_size": 3,
+        "p_dropout": 0.1,
+        "resblock": "1",
+        "resblock_kernel_sizes": [3, 7, 11],
+        "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+        "upsample_rates": [8, 8, 2, 2],
+        "upsample_initial_channel": 512,
+        "upsample_kernel_sizes": [16, 16, 4, 4],
+        "use_sdp": true,
+        "noise_scale": 1.0,
+        "inference_noise_scale": 0.667,
+        "length_scale": 1.0,
+        "noise_scale_w": 0.8
+    },
+    "audio": {
+        "sample_rate": 22050,
+        "win_length": 1024,
+        "hop_length": 256,
+        "num_mels": 80,
+        "mel_fmin": 0,
+        "mel_fmax": null
+    },
+    "batch_size": 32,
+    "eval_batch_size": 16,
+    "num_loader_workers": 4,
+    "num_eval_loader_workers": 4,
+    "run_eval": true,
+    "test_delay_epochs": -1,
+    "epochs": 1000,
+    "text_cleaner": "multilingual_cleaners",
+    "use_phonemes": true,
+    "phonemizer": "espeak",
+    "phoneme_language": "mr",
+    "phoneme_cache_path": "/Users/parth/Documents/marathi_tts_work/processed/phoneme_cache",
+    "compute_input_seq_cache": true,
+    "print_step": 25,
+    "print_eval": true,
+    "mixed_precision": true,
+    "cudnn_benchmark": false,
+    "optimizer": "AdamW",
+    "optimizer_params": {
+        "betas": [0.8, 0.99],
+        "eps": 1e-09,
+        "weight_decay": 0.01
+    },
+    "lr_scheduler": "ExponentialLR",
+    "lr_scheduler_params": {
+        "gamma": 0.999875
+    },
+    "lr": 0.0002,
+    "datasets": [
+        {
+            "formatter": "ljspeech",
+            "name": "marathi_tts",
+            "path": "/Users/parth/Documents/marathi_tts_work/processed",
+            "meta_file_train": "metadata_train.csv",
+            "meta_file_val": "metadata_val.csv",
+            "language": "mr"
+        }
+    ]
+}

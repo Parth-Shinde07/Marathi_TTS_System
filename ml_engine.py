@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import os
+import re
 from transformers import VitsModel, VitsTokenizer
 import librosa
 
@@ -62,17 +63,23 @@ class MMSVitsEngine:
 
     def generate_speech(self, text, speed=1.0, **kwargs):
         """MMS/VITS generation with quality-focused parameters."""
-        # Strip newlines to avoid tokenizer warnings
+        # Strip newlines and non-Devanagari characters to ensure the MMS tokenizer doesn't hallucinate
         text = text.replace("\n", " ")
-        inputs = self.tokenizer(text=text, return_tensors="pt").to(self.device)
+        text = re.sub(r"[^\u0900-\u097F ।\.!?]", "", text)
         
-        # Adjust speed if provided (VITS supports this via speaking_rate in some versions, 
-        # but here we handle it in prosody or via model if supported)
+        # Move model to CPU for inference to resolve the 'leaky_relu' MPS/Metal bug
+        # VITS is highly optimized and runs in real-time even on a single CPU core.
+        self.model.to("cpu")
+        inputs = self.tokenizer(text=text, return_tensors="pt").to("cpu")
+        
+        # Set to absolute deterministic mode for the purest possible signal
+        self.model.speaking_rate = speed
+        self.model.noise_scale = 0.0      # Zero variation = Absolute signal purity
+        self.model.noise_scale_w = 0.2    # Minimal duration jitter
         
         with torch.no_grad():
-            # Standard VITS forward pass
             outputs = self.model(**inputs)
-            waveform = outputs.waveform[0].cpu().numpy()
+            waveform = outputs.waveform[0].numpy()
             
         # Normalize waveform to prevent clipping before post-processing
         if np.abs(waveform).max() > 0:
